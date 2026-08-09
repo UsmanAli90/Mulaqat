@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Postgres 16, matching docker-compose.yml. Redis is deliberately absent:
+    # nothing uses it until the ARQ worker lands in Phase 5, and CI should not
+    # start services the tests do not touch.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: booking
+          POSTGRES_PASSWORD: booking
+          POSTGRES_DB: booking_dev
+        ports:
+          - 5432:5432
+        # Without this the job can start connecting before Postgres accepts
+        # connections. `services` has no depends_on, so the health check is
+        # the only ordering guarantee available.
+        options: >-
+          --health-cmd "pg_isready -U booking -d booking_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Port 5432 here, not the 5433 used locally: service containers map to
+      # the default port on the runner. The test suite derives booking_test
+      # from this URL by swapping the database name, and creates it itself.
+      DATABASE_URL: postgresql+asyncpg://booking:booking@localhost:5432/booking_dev
+      ENVIRONMENT: test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --locked fails if uv.lock is out of date with pyproject.toml, so a
+        # dependency change that was never locked cannot pass CI. uv reads
+        # .python-version and fetches 3.13 itself; no setup-python needed.
+        run: uv sync --locked
+
+      # The four checks below mirror what runs locally, in the same order.
+      # Each has its own step so a failure names itself in the UI.
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format (ruff format --check)
+        run: uv run ruff format --check .
+
+      - name: Type check (mypy, strict on app/)
+        run: uv run mypy app/
+
+      - name: Tests (real Postgres, migrated by Alembic)
+        run: uv run pytest -q
