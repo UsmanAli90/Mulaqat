@@ -1,0 +1,42 @@
+# Infrastructure only. The FastAPI app and the ARQ worker run on the host
+# (`uv run uvicorn ...`), so there is no app container here and no image to
+# rebuild when you edit code.
+#
+# Ports are deliberately non-default (5433 / 6380) so this project cannot
+# collide with a Postgres or Redis you already have installed locally.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      POSTGRES_DB: booking_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # `depends_on: condition: service_healthy` (used by future services and
+      # by CI) needs this to know Postgres is actually accepting connections,
+      # not merely that the container started.
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking_dev"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  postgres_data:
+  redis_data:
