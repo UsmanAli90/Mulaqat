@@ -37,7 +37,8 @@ cannot run in parallel with each other.
 
 import asyncio
 import os
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 
 import pytest
 from alembic import command
@@ -45,7 +46,6 @@ from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
-    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -157,30 +157,41 @@ async def engine(migrated_database: str) -> AsyncGenerator[AsyncEngine]:
     await test_engine.dispose()
 
 
-@pytest.fixture
-async def connection(engine: AsyncEngine) -> AsyncGenerator[AsyncConnection]:
-    """One connection with an open outer transaction, rolled back on teardown."""
+@asynccontextmanager
+async def rollback_isolated_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    """Open a session inside a transaction that is always rolled back.
+
+    This is the actual isolation mechanism, factored out of the `session`
+    fixture so `test_rollback_isolation.py` can drive it twice inside a single
+    test. Both callers therefore exercise the same code path — if this helper
+    were to break, the fixture and the test proving the fixture would break
+    together, rather than the test quietly validating a copy of the logic.
+
+    `join_transaction_mode="create_savepoint"` is the load-bearing part: any
+    commit() the code under test performs opens and releases a SAVEPOINT
+    inside our outer transaction, so application code sees normal commit
+    semantics and the outer rollback still erases everything.
+    """
     async with engine.connect() as conn:
         transaction = await conn.begin()
-        yield conn
-        await transaction.rollback()
+        factory = async_sessionmaker(
+            bind=conn,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            async with factory() as test_session:
+                yield test_session
+        finally:
+            # In a finally block so a failing assertion inside the test still
+            # leaves the database clean for whatever runs next.
+            await transaction.rollback()
 
 
 @pytest.fixture
-async def session(connection: AsyncConnection) -> AsyncGenerator[AsyncSession]:
-    """Rollback-isolated session. The default for every test.
-
-    Bound to the already-open connection above. `join_transaction_mode=
-    "create_savepoint"` makes any commit() the code under test performs open
-    and release a SAVEPOINT inside our outer transaction, so application code
-    can commit normally and the outer rollback still erases everything.
-    """
-    factory = async_sessionmaker(
-        bind=connection,
-        expire_on_commit=False,
-        join_transaction_mode="create_savepoint",
-    )
-    async with factory() as test_session:
+async def session(engine: AsyncEngine) -> AsyncGenerator[AsyncSession]:
+    """Rollback-isolated session. The default for every test."""
+    async with rollback_isolated_session(engine) as test_session:
         yield test_session
 
 
