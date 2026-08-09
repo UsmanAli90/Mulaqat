@@ -1,0 +1,89 @@
+[project]
+name = "booking"
+version = "0.1.0"
+description = "Single-tenant 1:1 booking platform"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "httpx>=0.28",
+    "ruff>=0.8",
+    "mypy>=1.14",
+    "freezegun>=1.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ---------------------------------------------------------------------------
+# ruff: linter + formatter. Rough equivalent of RuboCop, but ~100x faster and
+# with the formatter (Black-compatible) built into the same binary.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort (import ordering)
+    "UP",  # pyupgrade (modernize syntax for the target version)
+    "B",   # flake8-bugbear (likely-bug patterns)
+    "SIM", # flake8-simplify
+    "TID", # flake8-tidy-imports
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic generates these files; its templates use star-imports and long lines.
+"migrations/versions/*" = ["E501"]
+
+# ---------------------------------------------------------------------------
+# mypy: strict on app/, relaxed on tests, per the spec.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = []
+# Show the error code (e.g. [arg-type]) so failures are searchable.
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+strict = false
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = "migrations.*"
+ignore_errors = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# asyncio_mode = "auto" means any `async def test_*` is collected and run
+# without needing an @pytest.mark.asyncio decorator on each one.
+asyncio_mode = "auto"
+# Async fixtures default to function scope; session-scoped async fixtures
+# (like our migrated database) declare their own loop scope explicitly.
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "commits: test needs real committed transactions across connections; uses the truncating DB mode instead of rollback isolation (see tests/conftest.py)",
+]

@@ -1,0 +1,23 @@
+# Environment — never commit real secrets. .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Uploads (receipt images in dev, Phase 5)
+/uploads/
+
+# macOS
+.DS_Store
