@@ -1,5 +1,10 @@
 # Phase 1 Notes — Foundation
 
+> **Amended after review.** Three changes landed after the first approval:
+> a `naming_convention` on the metadata, a rewrite of the order-dependent
+> isolation test, and confirmation that `compare_type` was already set. See
+> [Post-review amendments](#post-review-amendments) at the bottom.
+
 ## What I built
 
 | Area | Files |
@@ -121,9 +126,10 @@ The subtlety is `join_transaction_mode="create_savepoint"`. Without it, a
 `commit()` in application code would commit our outer transaction and defeat the
 whole scheme. With it, that commit opens and releases a **SAVEPOINT** nested
 inside our transaction — application code sees normal commit semantics, and the
-outer rollback still erases everything. `test_a_write_is_visible_within_its_own_test`
-and `test_b_previous_test_was_rolled_back` are a deliberate pair proving exactly
-this: A commits a table and a row, B asserts the table does not exist.
+outer rollback still erases everything.
+`test_rollback_isolation_erases_committed_writes` proves exactly this by
+driving the mechanism twice in one test: commit a table and a row in the first
+scope, assert the table does not exist in the second.
 
 **Escape-hatch mode (`committing_sessionmaker` fixture) — real commits, then
 TRUNCATE.** As we agreed under point (c). Rollback isolation *cannot* test the
@@ -194,6 +200,66 @@ the first time you deploy with a managed-Postgres password.
   Phase 2 adds the real schema.
 - No `README.md` yet — that is Phase 8 per the build plan. The commands above
   cover local setup in the meantime.
+
+---
+
+## Post-review amendments
+
+### 1. Naming convention on the metadata
+
+`NAMING_CONVENTION` is now applied to `Base.metadata` in
+[app/db/base.py](app/db/base.py). You were right that this had to land before
+any schema exists: adding it later would leave every existing constraint with
+its auto-generated name while new ones follow the convention, which is worse
+than either alone. The reason it matters is that Alembic writes real DDL and
+`op.drop_constraint()` must name the exact object — unlike Rails, which
+regenerates `schema.rb` and never needs to know.
+
+**Phase 2 gotcha:** the `ck` rule interpolates `%(constraint_name)s`, so every
+`CheckConstraint` must be given an explicit `name=`. An unnamed one raises at
+class-definition time. That is the behaviour we want, but it will bite the
+first time it happens.
+
+### 2. The order-dependent test pair is gone
+
+Replaced with `test_rollback_isolation_erases_committed_writes`, a single test
+that drives the isolation mechanism twice inside its own body. Your reasoning
+was correct and I under-weighted it: the old test B passed vacuously under
+`pytest -k`, under a re-run of a single failure, and under any future parallel
+plugin that reorders.
+
+To make the two callers share one implementation rather than a copy, the
+mechanism moved out of the fixture into a `rollback_isolated_session()` async
+context manager in [tests/conftest.py](tests/conftest.py). The `session`
+fixture is now a thin wrapper over it, so the test and the fixture exercise
+the same code path — if the helper breaks, both break together.
+
+I verified the new test actually has teeth rather than assuming it: sabotaging
+the helper to `commit()` instead of `rollback()` makes it **fail when run
+entirely alone**, which is exactly the property the old pair lacked. The
+rollback also moved into a `finally` block so a failing assertion mid-test
+still leaves the database clean.
+
+Added `test_session_fixture_is_rollback_isolated` alongside it. That one guards
+the *wiring* rather than the mechanism: if `session` were ever re-pointed at a
+plain committing sessionmaker, the main test would still pass while the whole
+suite silently lost isolation.
+
+### 3. `compare_type` — already in place
+
+`compare_type=True` and `compare_server_default=True` were already set in
+`do_run_migrations` at [migrations/env.py:85-87](migrations/env.py#L85-L87).
+They are on the online path only, which is correct: offline mode (`--sql`)
+renders existing revisions and never autogenerates, so the flags would do
+nothing there.
+
+### Carried into Phase 2 (not built yet)
+
+- Autogenerate will **not** detect `btree_gist` or the exclusion constraint.
+  Both `CREATE EXTENSION btree_gist` and the constraint itself get hand-written
+  into the migration.
+- `PHASE_2_NOTES.md` will state explicitly which parts of that migration were
+  generated and which were hand-written.
 
 ---
 
