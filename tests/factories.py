@@ -13,7 +13,7 @@ objects; the caller decides when to add and flush, because roughly half these
 tests are specifically about what happens *at* flush.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from datetime import date as date_type
 from decimal import Decimal
 from typing import Any
@@ -31,7 +31,6 @@ from app.models import (
     PaymentStatus,
     Service,
     Settings,
-    compute_blocked_range,
 )
 from app.models.settings import SETTINGS_ID
 
@@ -110,43 +109,30 @@ def build_booking(
     service: Service,
     *,
     starts_at_utc: datetime | None = None,
-    duration_minutes: int | None = None,
-    buffer_before_minutes: int = 0,
-    buffer_after_minutes: int = 0,
     **overrides: Any,
 ) -> Booking:
-    """A pending booking with a correctly computed blocked_range.
+    """A pending booking, built through the sanctioned constructor.
 
-    The buffers are explicit parameters rather than read off `service`, because
-    the tests that matter here are precisely about a booking whose footprint
-    was computed with buffers that the service may no longer carry. Passing
-    them in keeps that visible at the call site.
+    Goes through `Booking.schedule()` rather than `Booking(...)` on purpose:
+    if the tests built bookings by a different route than the application
+    does, they would stop being evidence about the application. Buffers and
+    duration therefore come off the `service` — set them there when a test
+    needs a particular footprint.
     """
     n = _next()
-    start = starts_at_utc or BASE_START
-    end = start + timedelta(minutes=duration_minutes or service.duration_minutes)
-
     defaults: dict[str, Any] = {
-        "service": service,
         "status": BookingStatus.PENDING_PAYMENT,
-        "starts_at_utc": start,
-        "ends_at_utc": end,
-        "blocked_range": compute_blocked_range(
-            start, end, buffer_before_minutes, buffer_after_minutes
-        ),
         "invitee_name": f"Invitee {n}",
         "invitee_email": f"invitee{n}@example.com",
         "invitee_timezone": "America/New_York",
         "currency": Currency.PKR,
         "amount": Decimal("5000.00"),
     }
-    merged = defaults | overrides
-    # `service` is passed as an object for convenience; the model has no
-    # relationship configured yet (Phase 4 adds them), so resolve it to the FK.
-    service_obj = merged.pop("service", None)
-    if service_obj is not None and "service_id" not in merged:
-        merged["service_id"] = service_obj.id
-    return Booking(**merged)
+    return Booking.schedule(
+        service=service,
+        starts_at_utc=starts_at_utc or BASE_START,
+        **(defaults | overrides),
+    )
 
 
 def build_payment(booking: Booking, **overrides: Any) -> Payment:

@@ -3,6 +3,7 @@
 import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -26,6 +27,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 from app.models.enums import BookingStatus, CancellationReason, Currency
 from app.models.mixins import TimestampMixin
+
+if TYPE_CHECKING:
+    # Import only for type checking: Service does not import Booking, and
+    # keeping this out of the runtime import graph avoids a cycle if it ever
+    # does. The annotation is quoted so it resolves lazily.
+    from app.models.service import Service
 
 CANCELLATION_TOKEN_BYTES = 32
 
@@ -84,6 +91,24 @@ class Booking(TimestampMixin, Base):
     carries the second: `excl_bookings_no_overlap`, a Postgres exclusion
     constraint over `blocked_range` scoped to the two slot-occupying statuses.
     The application pre-check and the 409 handling are Phase 4.
+
+    ========================================================================
+    Build bookings with `Booking.schedule()`. Never set `blocked_range`,
+    or `ends_at_utc`, by hand.
+    ========================================================================
+
+    `blocked_range` is NOT NULL and set by the application, which means the
+    exclusion constraint is only as trustworthy as the value put in that
+    column. If two code paths could construct it they would eventually
+    disagree, and the database would be guarding a footprint that does not
+    match the booking it belongs to — a class of bug that shows up as a
+    double-booked host and is nearly impossible to trace afterwards.
+
+    So there is exactly one constructor. `schedule()` derives `ends_at_utc`
+    from the service's duration and `blocked_range` from the service's
+    buffers, and is the only sanctioned way to create a booking. Calling
+    `Booking(...)` directly is reserved for loading rows and for tests that
+    deliberately construct invalid state to prove a constraint fires.
     """
 
     __tablename__ = "bookings"
@@ -171,7 +196,13 @@ class Booking(TimestampMixin, Base):
     # documented exception, create_from_reschedule() (Phase 4). Walking this
     # chain is how a rescheduled booking finds the payment that paid for it.
     rescheduled_from_id: Mapped[int | None] = mapped_column(
-        ForeignKey("bookings.id", ondelete="SET NULL"),
+        # RESTRICT, never CASCADE and never SET NULL. Bookings are not meant to
+        # be hard-deleted at all, but if one ever is: CASCADE would take the
+        # whole reschedule chain and its payment history with it, and SET NULL
+        # would quietly sever the link, leaving a rescheduled booking unable to
+        # find the payment that paid for it. RESTRICT refuses the delete
+        # instead, which is the only outcome that cannot lose money.
+        ForeignKey("bookings.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -202,6 +233,54 @@ class Booking(TimestampMixin, Base):
         # in SQL there and deliberately not here — declaring it in both places
         # would let them drift.
     )
+
+    @classmethod
+    def schedule(
+        cls,
+        *,
+        service: "Service",
+        starts_at_utc: datetime,
+        **fields: Any,
+    ) -> "Booking":
+        """The single sanctioned way to create a booking.
+
+        Derives the two values that must never be supplied by a caller:
+
+          * `ends_at_utc` — from the service's `duration_minutes`, so the
+            meeting length can never contradict the service that was booked.
+          * `blocked_range` — from the service's buffers via
+            `compute_blocked_range()`, so the footprint the exclusion
+            constraint indexes always matches the meeting it belongs to.
+
+        Passing either explicitly is a TypeError rather than a silent
+        override: an override is exactly the second construction path this
+        method exists to prevent.
+
+        Everything else (invitee details, currency, amount, UTM, status) is
+        passed through untouched, because none of it participates in the
+        double-booking guarantee.
+        """
+        forbidden = {"ends_at_utc", "blocked_range"} & fields.keys()
+        if forbidden:
+            raise TypeError(
+                f"{sorted(forbidden)} are derived by Booking.schedule() and must not be "
+                "passed in. They are computed from the service's duration and buffers so "
+                "that blocked_range can never disagree with the meeting it guards."
+            )
+
+        ends_at_utc = starts_at_utc + timedelta(minutes=service.duration_minutes)
+        return cls(
+            service_id=service.id,
+            starts_at_utc=starts_at_utc,
+            ends_at_utc=ends_at_utc,
+            blocked_range=compute_blocked_range(
+                starts_at_utc,
+                ends_at_utc,
+                service.buffer_before_minutes,
+                service.buffer_after_minutes,
+            ),
+            **fields,
+        )
 
     def __repr__(self) -> str:
         return f"<Booking id={self.id} status={self.status.value} starts={self.starts_at_utc}>"
