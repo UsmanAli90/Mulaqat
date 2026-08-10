@@ -18,7 +18,7 @@ CHECK was expected, for instance.
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date, time
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -27,6 +27,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.wall_clock import MINUTES_PER_DAY
 from app.models import AvailabilityRule, DateOverrideType, Service, Settings
 from app.schemas.intake import IntakeQuestion, IntakeQuestionSet, IntakeQuestionType
 from tests.factories import (
@@ -260,7 +261,7 @@ async def test_intake_question_rejects_unknown_field() -> None:
 
 
 async def test_availability_rule_defaults(session: AsyncSession) -> None:
-    rule = AvailabilityRule(day_of_week=0, start_time=time(20, 0), end_time=time(23, 0))
+    rule = AvailabilityRule(day_of_week=0, start_minute=1200, end_minute=1380)
     session.add(rule)
     await session.flush()
     await session.refresh(rule)
@@ -277,7 +278,7 @@ async def test_availability_rule_rejects_day_outside_week(session: AsyncSession,
 
 async def test_availability_rule_rejects_end_before_start(session: AsyncSession) -> None:
     async with expect_violation(session, "ck_availability_rules_end_after_start"):
-        session.add(build_availability_rule(start_time=time(23, 0), end_time=time(20, 0)))
+        session.add(build_availability_rule(start_minute=1380, end_minute=1200))
         await session.flush()
 
 
@@ -289,96 +290,91 @@ async def test_availability_rule_rejects_overnight_window(session: AsyncSession)
     the Phase 3 availability engine.
     """
     async with expect_violation(session, "ck_availability_rules_end_after_start"):
-        session.add(build_availability_rule(start_time=time(22, 0), end_time=time(2, 0)))
+        # 22:00 -> 02:00
+        session.add(build_availability_rule(start_minute=1320, end_minute=120))
         await session.flush()
 
 
-async def test_postgres_accepts_24h_time_but_python_cannot_read_it() -> None:
-    """Documents *why* `ck_availability_rules_end_time_before_24h` exists.
-
-    Postgres treats '24:00:00' as a valid TIME and `end_time > start_time`
-    passes for it, so nothing at the SQL layer objects. Python's
-    `datetime.time` maxes out at 23:59:59.999999, so a row containing it can
-    never be read back — asyncpg raises while decoding, which takes down every
-    query selecting that table, not just the offending rule.
-
-    Asserting the Python limitation directly keeps this test honest even if a
-    future Postgres or driver changes behaviour: if `time(24, 0)` ever becomes
-    constructible, this fails and the guard can be revisited.
-    """
-    with pytest.raises(ValueError, match="hour must be in 0..23"):
-        time(24, 0)
-
-
-async def test_availability_rule_rejects_24h_end_time(session: AsyncSession) -> None:
-    """The poison value cannot be inserted, even by raw SQL bypassing the ORM."""
-    async with expect_violation(session, "ck_availability_rules_end_time_before_24h"):
-        await session.execute(
-            text(
-                "INSERT INTO availability_rules (day_of_week, start_time, end_time) "
-                "VALUES (0, '22:00:00', '24:00:00')"
-            )
-        )
-
-
-async def test_availability_rule_accepts_one_second_before_midnight(
-    session: AsyncSession,
+@pytest.mark.parametrize("minute", [1441, 99999])
+async def test_availability_rule_rejects_end_minute_past_the_day(
+    session: AsyncSession, minute: int
 ) -> None:
-    """23:59:59 is the documented value for a window ending at midnight.
+    """Values chosen so `end_after_start` is satisfied and the range check is
+    the constraint actually under test — otherwise this would pass on the
+    wrong violation."""
+    async with expect_violation(session, "ck_availability_rules_end_minute_range"):
+        session.add(build_availability_rule(start_minute=0, end_minute=minute))
+        await session.flush()
 
-    See the loud warning in the AvailabilityRule docstring: this leaves a
-    one-second seam, which Phase 3 has to account for or lose the final slot.
+
+@pytest.mark.parametrize("minute", [-1, -600])
+async def test_availability_rule_rejects_negative_start_minute(
+    session: AsyncSession, minute: int
+) -> None:
+    async with expect_violation(session, "ck_availability_rules_start_minute_range"):
+        session.add(build_availability_rule(start_minute=minute, end_minute=600))
+        await session.flush()
+
+
+async def test_availability_rule_accepts_midnight_end(session: AsyncSession) -> None:
+    """Minute 1440 is a first-class value, which is the point of the change.
+
+    Under the old TIME columns this had to be 23:59:59, leaving a one-second
+    seam that cost the last slot of the window. As an integer, 1440 is exactly
+    midnight and the seam is gone.
     """
-    rule = build_availability_rule(start_time=time(22, 0), end_time=time(23, 59, 59))
+    rule = build_availability_rule(start_minute=1320, end_minute=1440)
     session.add(rule)
     await session.flush()
     await session.refresh(rule)
 
-    assert rule.end_time == time(23, 59, 59)
+    assert rule.end_minute == 1440
 
 
-async def test_availability_rule_accepts_a_window_starting_at_midnight(
-    session: AsyncSession,
-) -> None:
-    """The other half of a split overnight window.
+async def test_split_overnight_window_meets_exactly(session: AsyncSession) -> None:
+    """The two halves of "Karachi 22:00 to 02:00" join with no gap.
 
-    22:00-23:59:59 on Monday plus 00:00-02:00 on Tuesday is how
-    "Karachi 22:00 to 02:00" is expressed — a normal working window for US
-    Eastern clients, not an edge case.
+    Monday 1320..1440 plus Tuesday 0..120. Because minute 1440 of one day and
+    minute 0 of the next are the same instant, the halves meet exactly — the
+    concrete improvement over the TIME representation. This window is
+    14:00-17:00 US Eastern, a normal working slot rather than an edge case.
     """
-    rule = build_availability_rule(day_of_week=1, start_time=time(0, 0), end_time=time(2, 0))
-    session.add(rule)
+    monday = build_availability_rule(day_of_week=0, start_minute=1320, end_minute=1440)
+    tuesday = build_availability_rule(day_of_week=1, start_minute=0, end_minute=120)
+    session.add_all([monday, tuesday])
     await session.flush()
-    await session.refresh(rule)
 
-    assert rule.start_time == time(0, 0)
+    assert monday.end_minute == 1440
+    assert tuesday.start_minute == 0
+    # The seam: end of one day and start of the next are the same instant.
+    assert monday.end_minute - MINUTES_PER_DAY == tuesday.start_minute
 
 
-async def test_date_override_rejects_24h_end_time(session: AsyncSession) -> None:
-    async with expect_violation(session, "ck_date_overrides_end_time_before_24h"):
+async def test_date_override_rejects_minutes_outside_the_day(session: AsyncSession) -> None:
+    async with expect_violation(session, "ck_date_overrides_end_minute_range"):
         await session.execute(
             text(
-                "INSERT INTO date_overrides (date, type, start_time, end_time) "
-                "VALUES ('2026-06-01', 'custom_hours', '09:00:00', '24:00:00')"
+                "INSERT INTO date_overrides (date, type, start_minute, end_minute) "
+                "VALUES ('2026-06-01', 'custom_hours', 540, 1441)"
             )
         )
 
 
-async def test_availability_rule_times_have_no_timezone(session: AsyncSession) -> None:
-    """These are host-local wall-clock readings, not moments in time.
+async def test_availability_minutes_are_stored_as_integers(session: AsyncSession) -> None:
+    """Guards the storage type directly.
 
-    If this column were ever changed to TIME WITH TIME ZONE, DST handling in
-    Phase 3 would break in a way that is very hard to see, so the storage type
-    is asserted directly.
+    These are host-local wall-clock readings, not moments. If the column ever
+    became a timestamp or reverted to TIME, Phase 3's arithmetic would break in
+    ways that are hard to see, so the type is asserted rather than assumed.
     """
     result = await session.execute(
         text(
             "SELECT data_type FROM information_schema.columns "
-            "WHERE table_name = 'availability_rules' AND column_name = 'start_time'"
+            "WHERE table_name = 'availability_rules' AND column_name = 'start_minute'"
         )
     )
 
-    assert result.scalar_one() == "time without time zone"
+    assert result.scalar_one() == "integer"
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +389,7 @@ async def test_blocked_override_requires_no_hours(session: AsyncSession) -> None
     await session.refresh(override)
 
     assert override.type is DateOverrideType.BLOCKED
-    assert override.start_time is None
+    assert override.start_minute is None
 
 
 async def test_blocked_override_rejects_hours(session: AsyncSession) -> None:
@@ -401,8 +397,8 @@ async def test_blocked_override_rejects_hours(session: AsyncSession) -> None:
         session.add(
             build_date_override(
                 type=DateOverrideType.BLOCKED,
-                start_time=time(9, 0),
-                end_time=time(17, 0),
+                start_minute=540,
+                end_minute=1020,
             )
         )
         await session.flush()
@@ -411,7 +407,9 @@ async def test_blocked_override_rejects_hours(session: AsyncSession) -> None:
 async def test_custom_hours_override_requires_hours(session: AsyncSession) -> None:
     async with expect_violation(session, "ck_date_overrides_hours_match_type"):
         session.add(
-            build_date_override(type=DateOverrideType.CUSTOM_HOURS, start_time=None, end_time=None)
+            build_date_override(
+                type=DateOverrideType.CUSTOM_HOURS, start_minute=None, end_minute=None
+            )
         )
         await session.flush()
 
@@ -421,8 +419,8 @@ async def test_custom_hours_override_rejects_end_before_start(session: AsyncSess
         session.add(
             build_date_override(
                 type=DateOverrideType.CUSTOM_HOURS,
-                start_time=time(17, 0),
-                end_time=time(9, 0),
+                start_minute=1020,
+                end_minute=540,
             )
         )
         await session.flush()
@@ -431,8 +429,8 @@ async def test_custom_hours_override_rejects_end_before_start(session: AsyncSess
 async def test_custom_hours_override_is_accepted(session: AsyncSession) -> None:
     override = build_date_override(
         type=DateOverrideType.CUSTOM_HOURS,
-        start_time=time(9, 0),
-        end_time=time(17, 0),
+        start_minute=540,
+        end_minute=1020,
         reason="Conference day",
     )
     session.add(override)
@@ -440,7 +438,7 @@ async def test_custom_hours_override_is_accepted(session: AsyncSession) -> None:
     await session.refresh(override)
 
     assert override.type is DateOverrideType.CUSTOM_HOURS
-    assert override.end_time == time(17, 0)
+    assert override.end_minute == 1020
 
 
 async def test_only_one_blocked_row_allowed_per_date(session: AsyncSession) -> None:
@@ -463,16 +461,16 @@ async def test_multiple_custom_hours_rows_allowed_per_date(session: AsyncSession
         build_date_override(
             date=date(2026, 6, 1),
             type=DateOverrideType.CUSTOM_HOURS,
-            start_time=time(9, 0),
-            end_time=time(12, 0),
+            start_minute=540,
+            end_minute=720,
         )
     )
     session.add(
         build_date_override(
             date=date(2026, 6, 1),
             type=DateOverrideType.CUSTOM_HOURS,
-            start_time=time(17, 0),
-            end_time=time(20, 0),
+            start_minute=1020,
+            end_minute=1200,
         )
     )
     await session.flush()
@@ -494,8 +492,8 @@ async def test_blocked_and_custom_hours_may_coexist_on_one_date(session: AsyncSe
         build_date_override(
             date=date(2026, 6, 2),
             type=DateOverrideType.CUSTOM_HOURS,
-            start_time=time(9, 0),
-            end_time=time(12, 0),
+            start_minute=540,
+            end_minute=720,
         )
     )
     session.add(build_date_override(date=date(2026, 6, 2), type=DateOverrideType.BLOCKED))
