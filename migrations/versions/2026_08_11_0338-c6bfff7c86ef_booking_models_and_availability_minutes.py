@@ -254,7 +254,8 @@ def upgrade() -> None:
             ["rescheduled_from_id"],
             ["bookings.id"],
             name=op.f("fk_bookings_rescheduled_from_id_bookings"),
-            ondelete="SET NULL",
+            # RESTRICT: a delete must fail rather than sever a reschedule chain.
+            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["service_id"],
