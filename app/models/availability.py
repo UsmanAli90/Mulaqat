@@ -5,24 +5,34 @@ Two tables, one recurring and one exceptional:
   availability_rules — the normal week ("Monday 20:00 to 23:00")
   date_overrides     — deviations for a specific date
 
-Both store **host-local wall clock** times, deliberately without timezone.
-The spec is explicit that availability is authored in the host's local time
-and converted to UTC at slot-generation time (Phase 3), which is what makes
-the schedule survive a DST transition: "Monday 8pm" stays 8pm on both sides
-of the jump, and it is the corresponding UTC instant that moves.
+Both store **host-local wall-clock times as INTEGER minutes from midnight**,
+deliberately without a date or a timezone. The spec is explicit that
+availability is authored in the host's local time and converted to UTC at
+slot-generation time (Phase 3), which is what makes the schedule survive a DST
+transition: "Monday 8pm" stays 8pm on both sides of the jump, and it is the
+corresponding UTC instant that moves.
 
-Storing these as TIMESTAMPTZ would force a date onto a rule that has none,
-and storing a UTC offset would rot twice a year. A bare TIME is the honest
-representation: it is not a moment, it is a wall-clock reading.
+Storing these as TIMESTAMPTZ would force a date onto a rule that has none, and
+storing a UTC offset would rot twice a year. Integers were chosen over `TIME`
+for arithmetic reasons explained in `app/core/wall_clock.py`.
+
+    Conversion reference (see app/core/wall_clock.py for helpers)
+    ─────────────────────────────────────────────────────────────
+        0  →  00:00       540  →  09:00      1320  →  22:00
+      720  →  12:00      1200  →  20:00      1440  →  24:00
+
+Minute 1440 is the exclusive end of the day and is how a window ending at
+midnight is expressed. A window crossing midnight is still entered as two
+rules, one per day — see the CHECK on `end_minute > start_minute`.
 """
 
 from datetime import date as date_type
-from datetime import time as time_type
 from enum import StrEnum
 
-from sqlalchemy import Boolean, CheckConstraint, Date, Enum, Index, Integer, Text, Time, text
+from sqlalchemy import Boolean, CheckConstraint, Date, Enum, Index, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.wall_clock import MINUTES_PER_DAY
 from app.db.base import Base
 from app.models.mixins import TimestampMixin
 
@@ -37,37 +47,15 @@ class DateOverrideType(StrEnum):
 class AvailabilityRule(TimestampMixin, Base):
     """One recurring weekly window of availability.
 
-    ========================================================================
-    A WINDOW THAT ENDS AT MIDNIGHT MUST USE end_time = 23:59:59.
-    NEVER 24:00:00. Read this before touching Phase 3's slot generation.
-    ========================================================================
+    Times are minutes from midnight, host-local. "Monday 20:00 to 23:00" is
+    `day_of_week=0, start_minute=1200, end_minute=1380`.
 
-    Postgres accepts `'24:00:00'::time` and `end_time > start_time` passes for
-    it, so the database will happily store that row. But Python's
-    `datetime.time` tops out at 23:59:59.999999, so asyncpg raises
-    `ValueError: hour must be in 0..23` when reading it back. The row becomes
-    permanently unreadable by the application — every query touching that table
-    fails, not just the one rule. `ck_availability_rules_end_time_before_24h`
-    now rejects the value outright so it cannot be inserted by any path,
-    including raw SQL.
-
-    **The consequence, stated loudly because it will look like a bug:**
-    23:59:59 is one second short of midnight. A rule of 22:00-23:59:59 with
-    30-minute slots does NOT yield a slot at 23:30, because that slot would end
-    at 00:00:00, one second past the window. Expect exactly one missing slot at
-    the end of any midnight-ending window.
-
-    This is not hypothetical for this host. 23:00-02:00 PKT is 14:00-17:00 US
-    Eastern, so an overnight-in-Karachi window is a normal working slot for
-    international clients. Such a window is entered as two rules
-    (Mon 22:00-23:59:59 and Tue 00:00-02:00), and the seam between them is
-    where the missing slot appears.
-
-    Phase 3 must decide how to close that one-second seam. The cheapest fix is
-    to treat a window end of 23:59:59 as exclusive-midnight when generating
-    slots; the alternative is storing minutes-from-midnight integers (0-1440)
-    instead of TIME, which removes the problem entirely at the cost of
-    readability in psql. Flagged in PHASE_2_NOTES.md rather than decided here.
+    A window crossing midnight is two rules. "Karachi 22:00 to 02:00" — which
+    is 14:00-17:00 US Eastern, a normal working window for international
+    clients rather than an edge case — is entered as Monday 1320..1440 plus
+    Tuesday 0..120. Because 1440 and 0 are the same instant, the two halves
+    meet exactly with no gap; this is the concrete improvement over the old
+    `TIME` representation, where the seam cost a slot.
     """
 
     __tablename__ = "availability_rules"
@@ -79,31 +67,32 @@ class AvailabilityRule(TimestampMixin, Base):
     # where 0 = Sunday — worth remembering before writing raw SQL against it.
     day_of_week: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    start_time: Mapped[time_type] = mapped_column(Time(timezone=False), nullable=False)
-    end_time: Mapped[time_type] = mapped_column(Time(timezone=False), nullable=False)
+    start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_minute: Mapped[int] = mapped_column(Integer, nullable=False)
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
     __table_args__ = (
         CheckConstraint("day_of_week BETWEEN 0 AND 6", name="day_of_week_range"),
-        # This forbids a window that wraps past midnight (22:00 to 02:00).
-        # Such availability must be entered as two rules, one per day. The
-        # alternative — allowing end < start and treating it as a wrap — makes
-        # every downstream calculation in Phase 3 carry a special case, and
-        # this host does not work past midnight.
-        CheckConstraint("end_time > start_time", name="end_after_start"),
-        # Blocks the 24:00:00 poison value described in the class docstring.
-        # Postgres considers it a valid TIME; Python cannot represent it, so a
-        # single such row makes the whole table unreadable through asyncpg.
-        CheckConstraint("end_time < TIME '24:00:00'", name="end_time_before_24h"),
-        CheckConstraint("start_time < TIME '24:00:00'", name="start_time_before_24h"),
+        CheckConstraint(
+            f"start_minute >= 0 AND start_minute <= {MINUTES_PER_DAY}",
+            name="start_minute_range",
+        ),
+        CheckConstraint(
+            f"end_minute >= 0 AND end_minute <= {MINUTES_PER_DAY}",
+            name="end_minute_range",
+        ),
+        # Forbids a window that wraps past midnight; such availability is two
+        # rules. Allowing end < start would put a wrap-around special case into
+        # every calculation in the Phase 3 availability engine.
+        CheckConstraint("end_minute > start_minute", name="end_after_start"),
         Index("ix_availability_rules_day_of_week", "day_of_week"),
     )
 
     def __repr__(self) -> str:
         return (
             f"<AvailabilityRule id={self.id} dow={self.day_of_week} "
-            f"{self.start_time}-{self.end_time}>"
+            f"{self.start_minute}-{self.end_minute}>"
         )
 
 
@@ -127,8 +116,7 @@ class DateOverride(TimestampMixin, Base):
         forbidding the combination — would mean the host cannot block a day
         without first deleting custom hours they may want back tomorrow.
 
-    The 24:00:00 warning on `AvailabilityRule` applies to this table's time
-    columns too, and is enforced by the same kind of CHECK.
+    Times are minutes from midnight, as on `AvailabilityRule`.
     """
 
     __tablename__ = "date_overrides"
@@ -151,16 +139,15 @@ class DateOverride(TimestampMixin, Base):
             # ("BLOCKED"), which is SQLAlchemy's default for a Python enum.
             # Without this the database would hold uppercase names while the
             # CHECK below compares lowercase values, so every insert would be
-            # rejected — and `psql` output would not match the JSON the API
-            # emits either.
+            # rejected.
             values_callable=lambda enum_cls: [member.value for member in enum_cls],
         ),
         nullable=False,
     )
 
     # Populated only for CUSTOM_HOURS; the CHECK below enforces that.
-    start_time: Mapped[time_type | None] = mapped_column(Time(timezone=False), nullable=True)
-    end_time: Mapped[time_type | None] = mapped_column(Time(timezone=False), nullable=True)
+    start_minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    end_minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -170,16 +157,21 @@ class DateOverride(TimestampMixin, Base):
         # against the enum's string values because CHECK runs in SQL, where the
         # Python enum does not exist.
         CheckConstraint(
-            "(type = 'blocked' AND start_time IS NULL AND end_time IS NULL) "
-            "OR (type = 'custom_hours' AND start_time IS NOT NULL "
-            "AND end_time IS NOT NULL AND end_time > start_time)",
+            "(type = 'blocked' AND start_minute IS NULL AND end_minute IS NULL) "
+            "OR (type = 'custom_hours' AND start_minute IS NOT NULL "
+            "AND end_minute IS NOT NULL AND end_minute > start_minute)",
             name="hours_match_type",
         ),
-        # Same 24:00:00 guard as AvailabilityRule. NULL-safe: a blocked row has
-        # NULL times, and `NULL < TIME '24:00:00'` is NULL, which a CHECK
-        # treats as satisfied.
-        CheckConstraint("end_time < TIME '24:00:00'", name="end_time_before_24h"),
-        CheckConstraint("start_time < TIME '24:00:00'", name="start_time_before_24h"),
+        # NULL-safe: a blocked row has NULL minutes, and `NULL >= 0` is NULL,
+        # which a CHECK treats as satisfied.
+        CheckConstraint(
+            f"start_minute >= 0 AND start_minute <= {MINUTES_PER_DAY}",
+            name="start_minute_range",
+        ),
+        CheckConstraint(
+            f"end_minute >= 0 AND end_minute <= {MINUTES_PER_DAY}",
+            name="end_minute_range",
+        ),
         # Partial unique index: at most one blocked row per date, while
         # custom_hours rows stay unconstrained. A plain unique index on `date`
         # would wrongly forbid split days.
