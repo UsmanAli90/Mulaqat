@@ -6,6 +6,7 @@ model that never reaches the metadata is invisible to Alembic autogenerate,
 which would then produce a migration dropping every table it cannot see.
 """
 
+from app.models.admin_user import AdminUser
 from app.models.availability import AvailabilityRule, DateOverride, DateOverrideType
 from app.models.booking import Booking, compute_blocked_range, generate_cancellation_token
 from app.models.enums import (
@@ -13,16 +14,22 @@ from app.models.enums import (
     BookingStatus,
     CancellationReason,
     Currency,
+    NotificationChannel,
+    NotificationStatus,
+    NotificationType,
     PaymentProvider,
     PaymentStatus,
 )
 from app.models.intake_response import IntakeResponse
+from app.models.notification import NotificationLog
 from app.models.payment import Payment
 from app.models.service import Service
 from app.models.settings import Settings
+from app.models.webhook_event import ProcessedWebhookEvent
 
 __all__ = [
     "SLOT_OCCUPYING_STATUSES",
+    "AdminUser",
     "AvailabilityRule",
     "Booking",
     "BookingStatus",
@@ -31,9 +38,14 @@ __all__ = [
     "DateOverride",
     "DateOverrideType",
     "IntakeResponse",
+    "NotificationChannel",
+    "NotificationLog",
+    "NotificationStatus",
+    "NotificationType",
     "Payment",
     "PaymentProvider",
     "PaymentStatus",
+    "ProcessedWebhookEvent",
     "Service",
     "Settings",
     "compute_blocked_range",
