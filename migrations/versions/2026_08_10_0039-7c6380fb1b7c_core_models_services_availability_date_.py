@@ -73,6 +73,12 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "end_time > start_time", name=op.f("ck_availability_rules_end_after_start")
         ),
+        sa.CheckConstraint(
+            "end_time < TIME '24:00:00'", name=op.f("ck_availability_rules_end_time_before_24h")
+        ),
+        sa.CheckConstraint(
+            "start_time < TIME '24:00:00'", name=op.f("ck_availability_rules_start_time_before_24h")
+        ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_availability_rules")),
     )
     op.create_index(
@@ -103,9 +109,24 @@ def upgrade() -> None:
             "(type = 'blocked' AND start_time IS NULL AND end_time IS NULL) OR (type = 'custom_hours' AND start_time IS NOT NULL AND end_time IS NOT NULL AND end_time > start_time)",
             name=op.f("ck_date_overrides_hours_match_type"),
         ),
+        sa.CheckConstraint(
+            "end_time < TIME '24:00:00'", name=op.f("ck_date_overrides_end_time_before_24h")
+        ),
+        sa.CheckConstraint(
+            "start_time < TIME '24:00:00'", name=op.f("ck_date_overrides_start_time_before_24h")
+        ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_date_overrides")),
     )
     op.create_index(op.f("ix_date_overrides_date"), "date_overrides", ["date"], unique=False)
+    # Partial unique index: at most one blocked row per date, while any number
+    # of custom_hours rows remain allowed for a split day.
+    op.create_index(
+        "uq_date_overrides_blocked_date",
+        "date_overrides",
+        ["date"],
+        unique=True,
+        postgresql_where=sa.text("type = 'blocked'"),
+    )
     op.create_table(
         "services",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -203,6 +224,7 @@ def downgrade() -> None:
     op.drop_table("settings")
     op.drop_index(op.f("ix_services_slug"), table_name="services")
     op.drop_table("services")
+    op.drop_index("uq_date_overrides_blocked_date", table_name="date_overrides")
     op.drop_index(op.f("ix_date_overrides_date"), table_name="date_overrides")
     op.drop_table("date_overrides")
     op.drop_index("ix_availability_rules_day_of_week", table_name="availability_rules")

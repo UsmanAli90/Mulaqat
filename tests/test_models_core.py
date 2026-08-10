@@ -18,7 +18,7 @@ CHECK was expected, for instance.
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import time
+from datetime import date, time
 from decimal import Decimal
 
 import pytest
@@ -293,6 +293,77 @@ async def test_availability_rule_rejects_overnight_window(session: AsyncSession)
         await session.flush()
 
 
+async def test_postgres_accepts_24h_time_but_python_cannot_read_it() -> None:
+    """Documents *why* `ck_availability_rules_end_time_before_24h` exists.
+
+    Postgres treats '24:00:00' as a valid TIME and `end_time > start_time`
+    passes for it, so nothing at the SQL layer objects. Python's
+    `datetime.time` maxes out at 23:59:59.999999, so a row containing it can
+    never be read back — asyncpg raises while decoding, which takes down every
+    query selecting that table, not just the offending rule.
+
+    Asserting the Python limitation directly keeps this test honest even if a
+    future Postgres or driver changes behaviour: if `time(24, 0)` ever becomes
+    constructible, this fails and the guard can be revisited.
+    """
+    with pytest.raises(ValueError, match="hour must be in 0..23"):
+        time(24, 0)
+
+
+async def test_availability_rule_rejects_24h_end_time(session: AsyncSession) -> None:
+    """The poison value cannot be inserted, even by raw SQL bypassing the ORM."""
+    async with expect_violation(session, "ck_availability_rules_end_time_before_24h"):
+        await session.execute(
+            text(
+                "INSERT INTO availability_rules (day_of_week, start_time, end_time) "
+                "VALUES (0, '22:00:00', '24:00:00')"
+            )
+        )
+
+
+async def test_availability_rule_accepts_one_second_before_midnight(
+    session: AsyncSession,
+) -> None:
+    """23:59:59 is the documented value for a window ending at midnight.
+
+    See the loud warning in the AvailabilityRule docstring: this leaves a
+    one-second seam, which Phase 3 has to account for or lose the final slot.
+    """
+    rule = build_availability_rule(start_time=time(22, 0), end_time=time(23, 59, 59))
+    session.add(rule)
+    await session.flush()
+    await session.refresh(rule)
+
+    assert rule.end_time == time(23, 59, 59)
+
+
+async def test_availability_rule_accepts_a_window_starting_at_midnight(
+    session: AsyncSession,
+) -> None:
+    """The other half of a split overnight window.
+
+    22:00-23:59:59 on Monday plus 00:00-02:00 on Tuesday is how
+    "Karachi 22:00 to 02:00" is expressed — a normal working window for US
+    Eastern clients, not an edge case.
+    """
+    rule = build_availability_rule(day_of_week=1, start_time=time(0, 0), end_time=time(2, 0))
+    session.add(rule)
+    await session.flush()
+    await session.refresh(rule)
+
+    assert rule.start_time == time(0, 0)
+
+
+async def test_date_override_rejects_24h_end_time(session: AsyncSession) -> None:
+    async with expect_violation(session, "ck_date_overrides_end_time_before_24h"):
+        await session.execute(
+            text(
+                "INSERT INTO date_overrides (date, type, start_time, end_time) "
+                "VALUES ('2026-06-01', 'custom_hours', '09:00:00', '24:00:00')"
+            )
+        )
+
+
 async def test_availability_rule_times_have_no_timezone(session: AsyncSession) -> None:
     """These are host-local wall-clock readings, not moments in time.
 
@@ -370,6 +441,66 @@ async def test_custom_hours_override_is_accepted(session: AsyncSession) -> None:
 
     assert override.type is DateOverrideType.CUSTOM_HOURS
     assert override.end_time == time(17, 0)
+
+
+async def test_only_one_blocked_row_allowed_per_date(session: AsyncSession) -> None:
+    """A second blocked row for the same date is meaningless, so it is rejected."""
+    session.add(build_date_override(date=date(2026, 12, 25), type=DateOverrideType.BLOCKED))
+    await session.flush()
+
+    async with expect_violation(session, "uq_date_overrides_blocked_date"):
+        session.add(build_date_override(date=date(2026, 12, 25), type=DateOverrideType.BLOCKED))
+        await session.flush()
+
+
+async def test_multiple_custom_hours_rows_allowed_per_date(session: AsyncSession) -> None:
+    """The partial index must not catch custom_hours: split days are legitimate.
+
+    09:00-12:00 plus 17:00-20:00 on one date is two rows, and a plain unique
+    index on `date` would have wrongly forbidden it.
+    """
+    session.add(
+        build_date_override(
+            date=date(2026, 6, 1),
+            type=DateOverrideType.CUSTOM_HOURS,
+            start_time=time(9, 0),
+            end_time=time(12, 0),
+        )
+    )
+    session.add(
+        build_date_override(
+            date=date(2026, 6, 1),
+            type=DateOverrideType.CUSTOM_HOURS,
+            start_time=time(17, 0),
+            end_time=time(20, 0),
+        )
+    )
+    await session.flush()
+
+    count = await session.execute(
+        text("SELECT count(*) FROM date_overrides WHERE date = '2026-06-01'")
+    )
+    assert count.scalar_one() == 2
+
+
+async def test_blocked_and_custom_hours_may_coexist_on_one_date(session: AsyncSession) -> None:
+    """Permitted by the database, resolved by the precedence rule.
+
+    A blocked row wins over any custom_hours rows for the same date (Phase 3
+    implements this). Forbidding the combination would mean the host cannot
+    block a day without first deleting custom hours they may want back.
+    """
+    session.add(
+        build_date_override(
+            date=date(2026, 6, 2),
+            type=DateOverrideType.CUSTOM_HOURS,
+            start_time=time(9, 0),
+            end_time=time(12, 0),
+        )
+    )
+    session.add(build_date_override(date=date(2026, 6, 2), type=DateOverrideType.BLOCKED))
+
+    await session.flush()
 
 
 async def test_date_override_type_is_stored_as_lowercase_value(session: AsyncSession) -> None:

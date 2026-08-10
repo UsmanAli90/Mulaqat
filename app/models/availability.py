@@ -20,7 +20,7 @@ from datetime import date as date_type
 from datetime import time as time_type
 from enum import StrEnum
 
-from sqlalchemy import Boolean, CheckConstraint, Date, Enum, Index, Integer, Text, Time
+from sqlalchemy import Boolean, CheckConstraint, Date, Enum, Index, Integer, Text, Time, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -35,7 +35,40 @@ class DateOverrideType(StrEnum):
 
 
 class AvailabilityRule(TimestampMixin, Base):
-    """One recurring weekly window of availability."""
+    """One recurring weekly window of availability.
+
+    ========================================================================
+    A WINDOW THAT ENDS AT MIDNIGHT MUST USE end_time = 23:59:59.
+    NEVER 24:00:00. Read this before touching Phase 3's slot generation.
+    ========================================================================
+
+    Postgres accepts `'24:00:00'::time` and `end_time > start_time` passes for
+    it, so the database will happily store that row. But Python's
+    `datetime.time` tops out at 23:59:59.999999, so asyncpg raises
+    `ValueError: hour must be in 0..23` when reading it back. The row becomes
+    permanently unreadable by the application — every query touching that table
+    fails, not just the one rule. `ck_availability_rules_end_time_before_24h`
+    now rejects the value outright so it cannot be inserted by any path,
+    including raw SQL.
+
+    **The consequence, stated loudly because it will look like a bug:**
+    23:59:59 is one second short of midnight. A rule of 22:00-23:59:59 with
+    30-minute slots does NOT yield a slot at 23:30, because that slot would end
+    at 00:00:00, one second past the window. Expect exactly one missing slot at
+    the end of any midnight-ending window.
+
+    This is not hypothetical for this host. 23:00-02:00 PKT is 14:00-17:00 US
+    Eastern, so an overnight-in-Karachi window is a normal working slot for
+    international clients. Such a window is entered as two rules
+    (Mon 22:00-23:59:59 and Tue 00:00-02:00), and the seam between them is
+    where the missing slot appears.
+
+    Phase 3 must decide how to close that one-second seam. The cheapest fix is
+    to treat a window end of 23:59:59 as exclusive-midnight when generating
+    slots; the alternative is storing minutes-from-midnight integers (0-1440)
+    instead of TIME, which removes the problem entirely at the cost of
+    readability in psql. Flagged in PHASE_2_NOTES.md rather than decided here.
+    """
 
     __tablename__ = "availability_rules"
 
@@ -59,6 +92,11 @@ class AvailabilityRule(TimestampMixin, Base):
         # every downstream calculation in Phase 3 carry a special case, and
         # this host does not work past midnight.
         CheckConstraint("end_time > start_time", name="end_after_start"),
+        # Blocks the 24:00:00 poison value described in the class docstring.
+        # Postgres considers it a valid TIME; Python cannot represent it, so a
+        # single such row makes the whole table unreadable through asyncpg.
+        CheckConstraint("end_time < TIME '24:00:00'", name="end_time_before_24h"),
+        CheckConstraint("start_time < TIME '24:00:00'", name="start_time_before_24h"),
         Index("ix_availability_rules_day_of_week", "day_of_week"),
     )
 
@@ -70,7 +108,28 @@ class AvailabilityRule(TimestampMixin, Base):
 
 
 class DateOverride(TimestampMixin, Base):
-    """A deviation from the weekly rules for one specific date."""
+    """A deviation from the weekly rules for one specific date.
+
+    **Precedence rule, authoritative:** a `blocked` row blocks the entire date
+    regardless of any `custom_hours` rows for that same date. Phase 3
+    implements it; the rule is recorded here because it is a property of the
+    data model, not of the engine that reads it.
+
+    The shape of the table follows from that rule:
+
+      * At most one `blocked` row per date — a second one would be meaningless,
+        so `uq_date_overrides_blocked_date` (a partial unique index) rejects
+        it.
+      * Any number of `custom_hours` rows per date, so a split day such as
+        09:00-12:00 plus 17:00-20:00 is expressible as two rows.
+      * A `blocked` row coexisting with `custom_hours` rows is permitted by the
+        database and resolved by the precedence rule above. The alternative —
+        forbidding the combination — would mean the host cannot block a day
+        without first deleting custom hours they may want back tomorrow.
+
+    The 24:00:00 warning on `AvailabilityRule` applies to this table's time
+    columns too, and is enforced by the same kind of CHECK.
+    """
 
     __tablename__ = "date_overrides"
 
@@ -115,6 +174,20 @@ class DateOverride(TimestampMixin, Base):
             "OR (type = 'custom_hours' AND start_time IS NOT NULL "
             "AND end_time IS NOT NULL AND end_time > start_time)",
             name="hours_match_type",
+        ),
+        # Same 24:00:00 guard as AvailabilityRule. NULL-safe: a blocked row has
+        # NULL times, and `NULL < TIME '24:00:00'` is NULL, which a CHECK
+        # treats as satisfied.
+        CheckConstraint("end_time < TIME '24:00:00'", name="end_time_before_24h"),
+        CheckConstraint("start_time < TIME '24:00:00'", name="start_time_before_24h"),
+        # Partial unique index: at most one blocked row per date, while
+        # custom_hours rows stay unconstrained. A plain unique index on `date`
+        # would wrongly forbid split days.
+        Index(
+            "uq_date_overrides_blocked_date",
+            "date",
+            unique=True,
+            postgresql_where=text("type = 'blocked'"),
         ),
     )
 
