@@ -29,12 +29,12 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# Importing the models package registers every model class on Base.metadata.
+# Without this, autogenerate sees an empty metadata and produces a migration
+# that drops every table in the database.
+import app.models  # noqa: F401
 from app.core.config import get_settings
 from app.db.base import Base
-
-# Importing the models package registers every model class on Base.metadata.
-# Phase 2 adds it; until then there is nothing to import and metadata is empty.
-# import app.models  # noqa: F401  (uncomment in Phase 2)
 
 config = context.config
 

@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Both long-lived branches, so the merge commit itself is verified and not
+    # just the PR that preceded it. Feature-branch pushes stay uncovered on
+    # purpose: the pull_request trigger already runs against the merge result,
+    # and adding them would double every run.
+    branches: [main, development]
   pull_request:
 
 # A new push to the same branch supersedes an in-flight run.
