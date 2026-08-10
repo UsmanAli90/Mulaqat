@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
+    SLOT_OCCUPYING_STATUSES,
     Booking,
     BookingStatus,
     CancellationReason,
@@ -246,6 +247,129 @@ async def test_rescheduled_from_id_links_the_chain(session: AsyncSession) -> Non
     assert replacement.rescheduled_from_id == original.id
 
 
+async def test_deleting_a_booking_in_a_reschedule_chain_is_refused(
+    session: AsyncSession,
+) -> None:
+    """RESTRICT on the self-FK, never CASCADE and never SET NULL.
+
+    Bookings are not meant to be hard-deleted at all. But if one ever is,
+    CASCADE would take the whole reschedule chain and its payment history, and
+    SET NULL would quietly sever the link so a rescheduled booking could no
+    longer find the payment that paid for it. RESTRICT refuses the delete,
+    which is the only outcome that cannot lose money.
+    """
+    service = await _persisted_service(session)
+    original = build_booking(service, status=BookingStatus.RESCHEDULED)  # type: ignore[arg-type]
+    session.add(original)
+    await session.flush()
+
+    session.add(
+        build_booking(
+            service,  # type: ignore[arg-type]
+            status=BookingStatus.CONFIRMED,
+            starts_at_utc=BASE_START + timedelta(days=2),
+            rescheduled_from_id=original.id,
+        )
+    )
+    await session.flush()
+
+    async with expect_violation(session, "fk_bookings_rescheduled_from_id_bookings"):
+        await session.execute(text("DELETE FROM bookings WHERE id = :id"), {"id": original.id})
+
+
+# ---------------------------------------------------------------------------
+# Booking.schedule — the single sanctioned constructor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("duration", "before", "after"),
+    [
+        (15, 0, 0),
+        (30, 0, 0),
+        (60, 15, 15),
+        (30, 5, 45),
+        (45, 60, 0),
+        (60, 0, 90),
+    ],
+)
+async def test_schedule_always_produces_a_consistent_blocked_range(
+    session: AsyncSession, duration: int, before: int, after: int
+) -> None:
+    """The property that makes the exclusion constraint trustworthy.
+
+    `blocked_range` is NOT NULL and application-set, so the constraint only
+    guarantees anything if that column always agrees with the booking's own
+    times and the service's buffers. Asserted across a spread of durations and
+    asymmetric buffers rather than one happy path, because a construction bug
+    that only shows up when the two buffers differ is exactly the kind that
+    survives a single example.
+    """
+    service = await _persisted_service(
+        session,
+        duration_minutes=duration,
+        buffer_before_minutes=before,
+        buffer_after_minutes=after,
+    )
+
+    booking = build_booking(service)  # type: ignore[arg-type]
+    session.add(booking)
+    await session.flush()
+    await session.refresh(booking)
+
+    # Duration comes from the service, never from the caller.
+    assert booking.ends_at_utc - booking.starts_at_utc == timedelta(minutes=duration)
+    # The footprint is exactly the meeting, padded by the service's buffers.
+    assert booking.blocked_range.lower == booking.starts_at_utc - timedelta(minutes=before)
+    assert booking.blocked_range.upper == booking.ends_at_utc + timedelta(minutes=after)
+    # Half-open, so back-to-back bookings do not collide on a shared endpoint.
+    assert booking.blocked_range.bounds == "[)"
+    # The footprint can never be narrower than the meeting it protects.
+    assert booking.blocked_range.lower <= booking.starts_at_utc
+    assert booking.blocked_range.upper >= booking.ends_at_utc
+
+
+async def test_schedule_refuses_a_caller_supplied_blocked_range(session: AsyncSession) -> None:
+    """A second construction path is the failure mode this guards against.
+
+    If a caller could override the footprint, the database would be enforcing
+    a value that no longer describes the booking — and the disagreement would
+    only surface as a double-booked host.
+    """
+    service = await _persisted_service(session)
+
+    with pytest.raises(TypeError, match="blocked_range"):
+        Booking.schedule(
+            service=service,  # type: ignore[arg-type]
+            starts_at_utc=BASE_START,
+            blocked_range=compute_blocked_range(
+                BASE_START, BASE_START + timedelta(minutes=5), 0, 0
+            ),
+            invitee_name="Mallory",
+            invitee_email="mallory@example.com",
+            invitee_timezone="UTC",
+            currency=Currency.PKR,
+            amount=Decimal("1.00"),
+        )
+
+
+async def test_schedule_refuses_a_caller_supplied_end_time(session: AsyncSession) -> None:
+    """Duration belongs to the service, so a caller cannot contradict it."""
+    service = await _persisted_service(session)
+
+    with pytest.raises(TypeError, match="ends_at_utc"):
+        Booking.schedule(
+            service=service,  # type: ignore[arg-type]
+            starts_at_utc=BASE_START,
+            ends_at_utc=BASE_START + timedelta(hours=8),
+            invitee_name="Mallory",
+            invitee_email="mallory@example.com",
+            invitee_timezone="UTC",
+            currency=Currency.PKR,
+            amount=Decimal("1.00"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # excl_bookings_no_overlap — the double-booking defence
 # ---------------------------------------------------------------------------
@@ -344,20 +468,96 @@ async def test_booking_may_overlap_an_expired_one(session: AsyncSession) -> None
 
 
 async def test_booking_may_overlap_a_rescheduled_one(session: AsyncSession) -> None:
-    """The old row of a reschedule must not block its own replacement.
+    """A rescheduled booking must release the slot it moved away from.
 
-    If RESCHEDULED occupied a slot, moving a booking to a *later* time inside
-    the original's buffered window would be impossible.
+    This is the status the whole reschedule design rests on. The old row keeps
+    its *original* times — that is the audit trail — so if RESCHEDULED were
+    ever in the exclusion constraint's WHERE predicate, moving a booking away
+    from a slot would poison that slot permanently. Nobody would notice until
+    a customer reported being unable to book a time the host could plainly see
+    was free.
+
+    Modelled as the real flow rather than two unrelated rows: an original moves
+    away, its replacement is linked by rescheduled_from_id, and a third party
+    then books the freed slot.
     """
     service = await _persisted_service(session)
-    session.add(build_booking(service, status=BookingStatus.RESCHEDULED))  # type: ignore[arg-type]
+
+    original = build_booking(service, status=BookingStatus.RESCHEDULED)  # type: ignore[arg-type]
+    session.add(original)
     await session.flush()
 
-    session.add(build_booking(service, status=BookingStatus.CONFIRMED))  # type: ignore[arg-type]
+    replacement = build_booking(
+        service,  # type: ignore[arg-type]
+        status=BookingStatus.CONFIRMED,
+        starts_at_utc=BASE_START + timedelta(days=2),
+        rescheduled_from_id=original.id,
+    )
+    session.add(replacement)
     await session.flush()
 
+    # A different invitee books the slot the original vacated.
+    someone_else = build_booking(
+        service,  # type: ignore[arg-type]
+        status=BookingStatus.CONFIRMED,
+        starts_at_utc=BASE_START,
+    )
+    session.add(someone_else)
+    await session.flush()
+
+    assert original.starts_at_utc == someone_else.starts_at_utc
+    assert replacement.rescheduled_from_id == original.id
     count = await session.execute(text("SELECT count(*) FROM bookings"))
-    assert count.scalar_one() == 2
+    assert count.scalar_one() == 3
+
+
+async def test_completed_and_no_show_bookings_also_release_their_slot(
+    session: AsyncSession,
+) -> None:
+    """Completes the coverage of the WHERE predicate.
+
+    Only PENDING_PAYMENT and CONFIRMED occupy the calendar. Asserting the
+    remaining terminal statuses keeps the predicate and SLOT_OCCUPYING_STATUSES
+    honest — a status silently added to the constraint would fail here.
+    """
+    for index, status in enumerate((BookingStatus.COMPLETED, BookingStatus.NO_SHOW)):
+        service = await _persisted_service(session)
+        start = BASE_START + timedelta(days=10 + index)
+
+        session.add(build_booking(service, status=status, starts_at_utc=start))  # type: ignore[arg-type]
+        await session.flush()
+
+        session.add(
+            build_booking(
+                service,  # type: ignore[arg-type]
+                status=BookingStatus.CONFIRMED,
+                starts_at_utc=start,
+            )
+        )
+        await session.flush()
+
+
+async def test_slot_occupying_statuses_matches_the_constraint_predicate(
+    session: AsyncSession,
+) -> None:
+    """Reads the live constraint and compares it to the Python constant.
+
+    `SLOT_OCCUPYING_STATUSES` is what Phase 3 and Phase 4 will filter on. If it
+    ever drifts from the database predicate, the application's idea of a free
+    slot stops matching the database's, and the two disagree only under
+    concurrency — the worst time to find out.
+    """
+    definition = await session.execute(
+        text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = :name"),
+        {"name": EXCLUSION},
+    )
+    predicate = definition.scalar_one()
+
+    for status in BookingStatus:
+        should_occupy = status in SLOT_OCCUPYING_STATUSES
+        assert (f"'{status.value}'" in predicate) is should_occupy, (
+            f"{status.value}: constraint predicate and SLOT_OCCUPYING_STATUSES disagree"
+        )
 
 
 async def test_buffers_block_bookings_whose_meetings_do_not_overlap(
@@ -374,19 +574,21 @@ async def test_buffers_block_bookings_whose_meetings_do_not_overlap(
     and leave the host with five minutes between calls instead of fifteen.
     Only a constraint over the buffered range catches it.
     """
-    service = await _persisted_service(session, duration_minutes=30)
+    service = await _persisted_service(
+        session, duration_minutes=30, buffer_before_minutes=15, buffer_after_minutes=15
+    )
 
     first = build_booking(
         service,  # type: ignore[arg-type]
         status=BookingStatus.CONFIRMED,
-        starts_at_utc=BASE_START,  # 10:00-10:30, blocked until 10:45
-        buffer_after_minutes=15,
+        starts_at_utc=BASE_START,  # 10:00-10:30, blocked 09:45-10:45
     )
     session.add(first)
     await session.flush()
 
-    second_start = BASE_START + timedelta(minutes=35)  # 10:35
-    # Sanity: the meetings themselves genuinely do not overlap.
+    second_start = BASE_START + timedelta(minutes=35)  # 10:35, blocked from 10:20
+    # Sanity: the meetings themselves genuinely do not overlap, so a constraint
+    # over starts_at_utc/ends_at_utc would have accepted this.
     assert second_start >= first.ends_at_utc
 
     async with expect_violation(session, EXCLUSION):
@@ -394,8 +596,7 @@ async def test_buffers_block_bookings_whose_meetings_do_not_overlap(
             build_booking(
                 service,  # type: ignore[arg-type]
                 status=BookingStatus.CONFIRMED,
-                starts_at_utc=second_start,  # blocked from 10:20
-                buffer_before_minutes=15,
+                starts_at_utc=second_start,
             )
         )
         await session.flush()
@@ -407,24 +608,20 @@ async def test_buffered_bookings_that_clear_each_other_are_allowed(
     """The mirror of the test above, so it is not passing for the wrong reason.
 
     Same buffers, but B starts late enough that the footprints just clear:
-    A blocks until 10:45, B blocks from 10:45.
+    A blocks until 10:45, B blocks from 10:45. They touch at exactly one
+    instant, which the '[)' bounds correctly treat as no overlap.
     """
-    service = await _persisted_service(session, duration_minutes=30)
-    session.add(
-        build_booking(
-            service,  # type: ignore[arg-type]
-            status=BookingStatus.CONFIRMED,
-            buffer_after_minutes=15,
-        )
+    service = await _persisted_service(
+        session, duration_minutes=30, buffer_before_minutes=15, buffer_after_minutes=15
     )
+    session.add(build_booking(service, status=BookingStatus.CONFIRMED))  # type: ignore[arg-type]
     await session.flush()
 
     session.add(
         build_booking(
             service,  # type: ignore[arg-type]
             status=BookingStatus.CONFIRMED,
-            starts_at_utc=BASE_START + timedelta(minutes=60),  # blocked from 10:45
-            buffer_before_minutes=15,
+            starts_at_utc=BASE_START + timedelta(minutes=60),  # 11:00, blocked from 10:45
         )
     )
     await session.flush()
@@ -443,7 +640,7 @@ async def test_editing_service_buffers_does_not_move_existing_footprints(
     and rewriting history would risk making already-confirmed bookings overlap.
     """
     service = await _persisted_service(session, buffer_after_minutes=15)
-    booking = build_booking(service, buffer_after_minutes=15)  # type: ignore[arg-type]
+    booking = build_booking(service)  # type: ignore[arg-type]
     session.add(booking)
     await session.flush()
     original_upper = booking.blocked_range.upper
