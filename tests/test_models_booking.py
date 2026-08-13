@@ -733,9 +733,16 @@ async def test_intake_response_is_unique_per_question_per_booking(
         await session.flush()
 
 
-async def test_deleting_a_booking_cascades_to_intake_responses(session: AsyncSession) -> None:
-    """Answers have no meaning without their booking, and no financial record
-    to preserve — unlike payments, which use RESTRICT."""
+async def test_deleting_a_booking_with_intake_answers_is_refused(
+    session: AsyncSession,
+) -> None:
+    """Intake answers are RESTRICT like everything else.
+
+    This was CASCADE originally. With every other key on RESTRICT, the cascade
+    could only fire for a booking with no payment, no notification and no
+    reschedule link — an expired pending one — where the answers are the only
+    surviving record of what the person asked for.
+    """
     service = await _persisted_service(session)
     booking = build_booking(service)  # type: ignore[arg-type]
     session.add(booking)
@@ -743,11 +750,56 @@ async def test_deleting_a_booking_cascades_to_intake_responses(session: AsyncSes
     session.add(build_intake_response(booking))
     await session.flush()
 
-    await session.execute(text("DELETE FROM bookings WHERE id = :id"), {"id": booking.id})
-    await session.flush()
+    async with expect_violation(session, "fk_intake_responses_booking_id_bookings"):
+        await session.execute(text("DELETE FROM bookings WHERE id = :id"), {"id": booking.id})
 
     count = await session.execute(text("SELECT count(*) FROM intake_responses"))
-    assert count.scalar_one() == 0
+    assert count.scalar_one() == 1
+
+
+async def test_every_foreign_key_into_bookings_is_restrict(session: AsyncSession) -> None:
+    """The deletion policy, asserted as one rule instead of four settings.
+
+    A booking is never hard-deleted; the state machine already provides every
+    way one legitimately ends. Reading the live catalogue rather than the
+    models means a migration that changed a referential action without
+    changing a model would still be caught.
+
+    If a new child table needs CASCADE, this test is where that argument has
+    to be made — which is the point.
+    """
+    result = await session.execute(
+        text(
+            # confdeltype is Postgres's internal "char" type, which asyncpg
+            # hands back as bytes; cast to text so the comparison below reads
+            # as characters rather than b'r'.
+            "SELECT conrelid::regclass::text AS child, confdeltype::text AS on_delete "
+            "FROM pg_constraint "
+            "WHERE contype = 'f' AND confrelid = 'bookings'::regclass"
+        )
+    )
+    rules = {row.child: row.on_delete for row in result}
+
+    # 'r' = RESTRICT. 'c' would be CASCADE, 'n' SET NULL, 'a' NO ACTION.
+    assert rules == {
+        "bookings": "r",
+        "intake_responses": "r",
+        "notification_log": "r",
+        "payments": "r",
+    }
+
+
+async def test_a_booking_with_a_payment_cannot_be_deleted(session: AsyncSession) -> None:
+    """The financial record is the one that must never vanish."""
+    service = await _persisted_service(session)
+    booking = build_booking(service)  # type: ignore[arg-type]
+    session.add(booking)
+    await session.flush()
+    session.add(build_payment(booking))
+    await session.flush()
+
+    async with expect_violation(session, "fk_payments_booking_id_bookings"):
+        await session.execute(text("DELETE FROM bookings WHERE id = :id"), {"id": booking.id})
 
 
 async def test_currency_and_amount_are_captured_on_the_booking(session: AsyncSession) -> None:
