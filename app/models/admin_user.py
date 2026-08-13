@@ -52,6 +52,46 @@ class AdminUser(TimestampMixin, Base):
     substitute for keeping the server uncompromised.
 
     ========================================================================
+    Key rotation: DECIDED. Single key now, MultiFernet in Phase 8 if ever.
+    ========================================================================
+
+    `app/core/encryption.py` uses one Fernet key. `MultiFernet` would let a
+    list of keys decrypt while the first encrypts, making rotation possible
+    without re-encrypting anything. It is deliberately not used yet.
+
+    **Why single-key is right for now:** this table holds one row, maybe a
+    handful. Rotating by hand is a loop over every row — read with the old
+    key, write with the new — that finishes in milliseconds and can run
+    inside one transaction. MultiFernet exists to avoid coordinating a
+    rewrite across a table too large or too hot to update in one pass, and
+    neither applies here. Adopting it now would add a permanently
+    multi-valued key setting, and a config shape you cannot simplify later,
+    to solve a problem this project does not have.
+
+    **The rotation procedure, for when it is needed:**
+
+      1. Generate a new key: `generate_key()`.
+      2. In one transaction, for each admin: read `totp_secret` (decrypts
+         under the old key), then rewrite it with the new key configured.
+         In practice: read every secret with the old key, restart with the
+         new key, write them back.
+      3. Keep the old key until the rewrite is confirmed, then destroy it.
+
+    Because that middle step needs both keys live at once, the honest
+    trigger for adopting MultiFernet is not row count — it is wanting
+    zero-downtime rotation. Revisit in Phase 8 alongside the secrets and
+    backup work, or the first time a rotation is actually needed.
+
+    **A suspected key leak is NOT a rotation problem, and this is the part
+    worth remembering under pressure.** Rotating the key re-encrypts the
+    same plaintext seeds. If an attacker held the key long enough to decrypt,
+    they now have the seeds themselves, and every new ciphertext protects a
+    secret they already know. Recovery is to **re-enrol every admin's
+    authenticator app** — new TOTP secrets — and rotate the encryption key as
+    hygiene alongside it. Key rotation alone would restore no security while
+    looking like it had.
+
+    ========================================================================
     Neither secret may ever leave this object
     ========================================================================
 

@@ -15,6 +15,11 @@ Note Fernet is **non-deterministic**: encrypting the same plaintext twice
 produces different ciphertexts, since each token carries a random IV and a
 timestamp. That is the correct property here, and it means an encrypted
 column can never be searched by value or given a useful unique index.
+
+Single key, not `MultiFernet`. That is a recorded decision, not an oversight —
+see the key-rotation section of `AdminUser`'s docstring for the reasoning, the
+manual rotation procedure, and why a suspected key leak needs re-enrolment
+rather than rotation.
 """
 
 from functools import lru_cache
