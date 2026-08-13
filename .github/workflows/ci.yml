@@ -45,6 +45,10 @@ jobs:
       # from this URL by swapping the database name, and creates it itself.
       DATABASE_URL: postgresql+asyncpg://booking:booking@localhost:5432/booking_dev
       ENVIRONMENT: test
+      # The public development key from .env.example. Safe here: CI encrypts
+      # only throwaway test data, and the app refuses to boot production with
+      # this value. A real deployment supplies its own via a secret.
+      TOTP_ENCRYPTION_KEY: tf8oL6aW8GfdvPXWW8N8362knn3S4TxiW4qY6SE9L6c=
 
     steps:
       - uses: actions/checkout@v7

@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.models import (
+    AdminUser,
     AvailabilityRule,
     Booking,
     BookingStatus,
@@ -26,9 +27,14 @@ from app.models import (
     DateOverride,
     DateOverrideType,
     IntakeResponse,
+    NotificationChannel,
+    NotificationLog,
+    NotificationStatus,
+    NotificationType,
     Payment,
     PaymentProvider,
     PaymentStatus,
+    ProcessedWebhookEvent,
     Service,
     Settings,
 )
@@ -154,3 +160,46 @@ def build_intake_response(booking: Booking, **overrides: Any) -> IntakeResponse:
         "answer_text": "Career advice",
     }
     return IntakeResponse(**(defaults | overrides))
+
+
+def build_admin_user(**overrides: Any) -> AdminUser:
+    """An enrolled admin.
+
+    The password hash is a realistic Argon2 digest and the TOTP secret a
+    realistic base32 seed, so the "these must never appear in a log" tests are
+    searching for values distinctive enough that a substring match means
+    something.
+    """
+    n = _next()
+    defaults: dict[str, Any] = {
+        "email": f"admin{n}@example.com",
+        "password_hash": ("$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$aVeryDistinctiveDigestValue"),
+        "totp_secret": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        "is_active": True,
+    }
+    return AdminUser(**(defaults | overrides))
+
+
+def build_webhook_event(**overrides: Any) -> ProcessedWebhookEvent:
+    """A processed webhook delivery."""
+    n = _next()
+    defaults: dict[str, Any] = {
+        "provider": "external_checkout",
+        "provider_event_id": f"evt_{n}",
+        "raw_body": b'{"type":"checkout.completed","id":"evt"}',
+        "payload": {"type": "checkout.completed", "id": "evt"},
+        "event_type": "checkout.completed",
+    }
+    return ProcessedWebhookEvent(**(defaults | overrides))
+
+
+def build_notification_log(booking: Booking, **overrides: Any) -> NotificationLog:
+    """A queued notification against the given booking."""
+    defaults: dict[str, Any] = {
+        "booking_id": booking.id,
+        "type": NotificationType.BOOKING_CONFIRMED,
+        "channel": NotificationChannel.EMAIL,
+        "status": NotificationStatus.QUEUED,
+        "retry_count": 0,
+    }
+    return NotificationLog(**(defaults | overrides))

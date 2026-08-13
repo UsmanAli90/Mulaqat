@@ -4,9 +4,45 @@ from typing import Any
 
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine.interfaces import Dialect
-from sqlalchemy.types import TypeDecorator
+from sqlalchemy.types import Text, TypeDecorator
 
+from app.core import encryption
 from app.schemas.intake import IntakeQuestion, IntakeQuestionSet
+
+
+class EncryptedString(TypeDecorator[str]):
+    """A TEXT column encrypted at rest with Fernet.
+
+    Plaintext in Python, ciphertext in the database. Used for
+    `admin_users.totp_secret`, which cannot be hashed because verifying a code
+    requires recomputing it from the original secret.
+
+    Two properties follow from Fernet being non-deterministic, and both are
+    intentional:
+
+      * The column **cannot be searched by value**. `WHERE totp_secret = ?`
+        will never match, because each encryption produces a different token.
+      * A unique index on it would be meaningless for the same reason.
+
+    Neither matters for a TOTP secret, which is only ever read by primary key.
+    Do not reach for this type on a column you need to query.
+
+    See `app/core/encryption.py` for what this does and does not protect
+    against — the threat model is narrower than "encrypted" suggests.
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: str | None, dialect: Dialect) -> str | None:
+        if value is None:
+            return None
+        return encryption.encrypt(value)
+
+    def process_result_value(self, value: str | None, dialect: Dialect) -> str | None:
+        if value is None:
+            return None
+        return encryption.decrypt(value)
 
 
 class IntakeQuestions(TypeDecorator[list[IntakeQuestion]]):

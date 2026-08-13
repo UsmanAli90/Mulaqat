@@ -75,3 +75,40 @@ class PaymentStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     REFUNDED = "refunded"
+
+
+class NotificationType(StrEnum):
+    """Which message was sent. One member per template in the Phase 6 list."""
+
+    BOOKING_CONFIRMED = "booking_confirmed"
+    REMINDER_24H = "reminder_24h"
+    REMINDER_1H = "reminder_1h"
+    CANCELLED = "cancelled"
+    RESCHEDULED = "rescheduled"
+    MANUAL_PAYMENT_RECEIVED = "manual_payment_received"
+    MANUAL_PAYMENT_REJECTED = "manual_payment_rejected"
+
+
+class NotificationChannel(StrEnum):
+    """How it was delivered.
+
+    Only EMAIL in V1. Modelled as an enum anyway because the column exists in
+    the spec and a second channel is plausible later; adding a member needs a
+    hand-written ALTER TYPE, since Alembic does not detect enum value changes.
+    """
+
+    EMAIL = "email"
+
+
+class NotificationStatus(StrEnum):
+    """Delivery state.
+
+    QUEUED and FAILED are distinct from each other *and* from a permanent
+    failure: a FAILED row with retries remaining will be attempted again,
+    while one that has exhausted them will not. `notification_log.retry_count`
+    is what separates those two, which is why the column exists.
+    """
+
+    QUEUED = "queued"
+    SENT = "sent"
+    FAILED = "failed"

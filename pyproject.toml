@@ -11,6 +11,8 @@ dependencies = [
     "alembic>=1.14",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
+    "cryptography>=50.0.0",
+    "alembic-postgresql-enum>=1.10.0",
 ]
 
 [dependency-groups]
