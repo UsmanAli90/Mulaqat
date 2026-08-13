@@ -12,7 +12,13 @@ dependencies = [
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "cryptography>=50.0.0",
-    "alembic-postgresql-enum>=1.10.0",
+    # Pinned exactly, not a range. migrations/env.py imports this, so it runs
+    # during `alembic upgrade head` in production — it is load-bearing for
+    # deploys, not a development convenience. A minor release that changed how
+    # enum operations are rendered would alter migration behaviour on a deploy
+    # that changed nothing else. Upgrade deliberately, with a regenerated
+    # migration to inspect.
+    "alembic-postgresql-enum==1.10.0",
 ]
 
 [dependency-groups]
