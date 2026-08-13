@@ -13,8 +13,14 @@ docker-compose up -d          # Postgres 16 + Redis 7
 cp .env.example .env
 uv sync                       # creates .venv and installs pinned deps
 uv run alembic upgrade head
+uv run python -m app.seed     # three services, a weekly rule, settings
 uv run pytest
 ```
+
+The seed is safe to run twice: it inserts what is missing and never overwrites
+what is already there, so it will not revert edits you have made. It creates no
+admin user — Phase 5 adds a CLI command that prompts for a password, so an
+admin never exists without credentials.
 
 Run the API:
 
