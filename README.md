@@ -43,8 +43,8 @@ CI runs exactly these four on every push and pull request.
 
 ## Status
 
-**Phase 1 of 8 complete** — foundation: project scaffold, Docker Compose for Postgres and Redis, typed settings, async SQLAlchemy engine and session dependency, FastAPI app factory, health endpoints, Alembic wiring, and the test-database fixtures.
+**Phase 2 of 8 complete** — domain models and migrations: ten tables, the `btree_gist`-free exclusion constraint preventing double-booking, encrypted TOTP secrets, and an idempotent seed script. Phase 1 delivered the foundation (scaffold, Compose, typed settings, async engine, app factory, health endpoints, Alembic, test fixtures).
 
-Phase 2 (domain models and migrations) is next. The full build plan lives in [BOOKING_PLATFORM_SPEC.md](BOOKING_PLATFORM_SPEC.md), and each completed phase has a `PHASE_N_NOTES.md`.
+Phase 3 (the availability engine) is next. The full build plan lives in [BOOKING_PLATFORM_SPEC.md](BOOKING_PLATFORM_SPEC.md); see [PHASE_1_NOTES.md](PHASE_1_NOTES.md) and [PHASE_2_NOTES.md](PHASE_2_NOTES.md) for what each completed phase decided and why.
 
 This README is intentionally brief; it gets expanded in Phase 8 with deployment, the architecture overview, and the booking state machine diagram.
