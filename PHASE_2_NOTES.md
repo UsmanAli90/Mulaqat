@@ -1,8 +1,8 @@
 # Phase 2 Notes — Domain Models and Migrations
 
-Ten tables, three migrations, 211 tests. Merged into `development` as four
-feature PRs (#1–#4), each with its own migration, kept sequential so the
-revision chain stayed linear.
+Ten tables, four migrations, 213 tests. Merged into `development` as five
+feature PRs, each carrying at most one migration, kept strictly sequential so
+the revision chain stayed linear and never forked into multiple heads.
 
 | Branch | What landed |
 |---|---|
@@ -10,10 +10,11 @@ revision chain stayed linear.
 | `feature/p2-02-booking-models` | `bookings`, `payments`, `intake_responses`, the exclusion constraint, availability as minutes |
 | `feature/p2-03-supporting-tables` | `admin_users`, `processed_webhook_events`, `notification_log`, secret encryption, autogenerate automation |
 | `feature/p2-04-seed-script` | Seed script, no admin user |
+| `feature/p2-06-deletion-policy` | `intake_responses` to RESTRICT; the no-hard-delete rule stated explicitly |
 
-**Status:** 211 tests passing, `ruff check` and `ruff format --check` clean,
-`mypy app/` clean under `strict = true`. All three migrations verified
-up → down → up on a fresh database, single head (`bc737c0339e0`), and
+**Status:** 213 tests passing, `ruff check` and `ruff format --check` clean,
+`mypy app/` clean under `strict = true`. All four migrations verified
+up → down → up on a fresh database, single head (`e68575c98769`), and
 autogenerate produces an empty diff against the models.
 
 ---
@@ -65,13 +66,20 @@ This is the second of the spec's three layers. The application pre-check
 that has to hold when the other two lose a race, which is why it is in the
 database and not in Python.
 
-**`btree_gist` turned out to be unnecessary.** The spec called for it, but that
+**The spec was wrong about `btree_gist`, and this corrects it.** That
 extension exists to mix *scalar equality* into a GIST index — `host_id WITH =,
-range WITH &&` — which a multi-tenant schema needs. This one is single-tenant:
-there is no scalar column in the constraint, and the status filter is a `WHERE`
-predicate rather than a constraint column. `tstzrange` has GIST support in core
-Postgres. Verified on a scratch database with the extension deliberately absent
-before removing it.
+range WITH &&` — which a multi-tenant schema needs. This schema is
+single-tenant: there is no scalar column in the constraint, and the status
+filter is a `WHERE` predicate rather than a constraint column. `tstzrange` has
+GIST support in core Postgres, so the extension was never required here.
+
+This is a correction to the spec, not a permitted deviation from it. Verified
+empirically on a scratch database with the extension explicitly absent: the
+constraint created successfully and correctly rejected an overlapping insert.
+The same probe confirmed that `'[)'` bounds admit back-to-back bookings while
+`'[]'` false-positives on the shared endpoint, and that the `WHERE` predicate
+lets a cancelled row overlap a confirmed one. Treat the spec's `btree_gist`
+requirement as superseded.
 
 ### 3. `blocked_range`, and why it is computed by the application
 
@@ -121,8 +129,8 @@ check is a plain `<=`.
 
 ### 5. Autogenerate is a draft, not an answer
 
-Every migration in this phase needed hand-editing, and two of the fixes were
-for defects that would have shipped silently:
+Three of the four migrations in this phase needed hand-editing, and two of the
+fixes were for defects that would have shipped silently:
 
 - Autogenerate rendered a column type change as **drop-column + add-column**,
   which destroys the data. It has no way to know the conversion you intend.
@@ -133,8 +141,17 @@ for defects that would have shipped silently:
   custom_hours rows coherent.
 
 Both are invisible in a green test run against an empty database. The habit
-that catches them is verifying a data migration **with a real row present**:
-insert at the previous revision, migrate, read the value back.
+that catches them is verifying a migration **with real rows present**: insert
+at the previous revision, migrate, and read the result back. That is how the
+minutes conversion was checked (`20:00` became `1200`, rather than the rows
+being silently dropped), and how the RESTRICT change was checked (cascade at
+the old revision, refusal at the new, data intact through the round trip).
+
+The fourth migration needed no hand-editing at all — autogenerate detected the
+changed referential action and emitted the drop-and-recreate unprompted. Worth
+saying, because "autogenerate is a draft" should not curdle into "autogenerate
+is always wrong": it is reliable for the things it can see, and the automation
+added in this phase widened that set.
 
 ---
 
@@ -171,12 +188,47 @@ itsdangerous is gone: a signed token with a short TTL is wrong for a link that
 must still work for a booking three weeks out, and a stored token can be
 invalidated on cancel, which a stateless one cannot.
 
-**`ON DELETE` rules are deliberate per table.** `RESTRICT` on
-`bookings.service_id`, `payments.booking_id`, `notification_log.booking_id`,
-and `bookings.rescheduled_from_id`; `CASCADE` only on `intake_responses`. The
-self-FK started as `SET NULL`, which is not a cascade but severs the link
-silently — leaving a rescheduled booking unable to find the payment that paid
-for it. `RESTRICT` refuses the delete, the only outcome that cannot lose money.
+**A booking is never hard-deleted, and that is a rule rather than a
+side-effect.** Every foreign key into `bookings` is `ON DELETE RESTRICT` —
+from `payments`, `notification_log`, `intake_responses`, and the table's own
+`rescheduled_from_id`. `bookings.service_id` is RESTRICT for the same reason.
+
+The state machine already provides every way a booking legitimately ends:
+`cancelled`, `expired`, `rescheduled`, `no_show`, `completed`. Those are
+terminal *states*, not terminal rows. A row that reached one still records
+that a real person asked for a real time, and the payment, notification and
+intake rows hanging off it are the audit trail of what was taken from them and
+what was sent to them.
+
+Two of those rules were corrections during review:
+
+- `rescheduled_from_id` started as `SET NULL`. Not a cascade, so the chain
+  survived — but the link was severed silently, leaving a rescheduled booking
+  unable to find the payment that paid for it.
+- `intake_responses` started as `CASCADE`, on the reasoning that an answer has
+  no meaning without its booking. That was wrong for a reason only visible
+  once the other keys were RESTRICT: a booking holding a payment, a
+  notification or a reschedule link cannot be deleted at all, so the cascade
+  could only ever fire for a booking with none of those — an expired pending
+  one — which is exactly the case where the intake answers are the *only*
+  surviving record of what the person asked for. Mixed rules also let a DELETE
+  half-succeed: blocked here, silently destructive there.
+
+**What RESTRICT does and does not give.** It makes deletion fail for any
+booking that has acquired a child row, which in practice is all of them within
+moments of creation. It does **not** forbid deleting a booking that has none —
+a pending booking seconds old, before any payment row exists. Closing that gap
+needs a `BEFORE DELETE` trigger or a revoked DELETE grant. Neither is worth
+adding until there is reason to think someone would try, but the gap is real
+and is recorded here rather than left as a false sense of completeness. The
+rule lives in the `Booking` docstring so it is a rule, not an inference from
+five separate column definitions, and `test_every_foreign_key_into_bookings_is_restrict`
+reads the live catalogue so a migration that changed a referential action
+without changing a model would still be caught.
+
+If data ever has to be removed for a privacy request, that is a different
+operation: redact the personal columns in place and keep the financial record.
+A cascade could not express that distinction anyway.
 
 **TOTP secret encrypted, not hashed.** Forced, not chosen: verifying a code
 means recomputing it from the original, so the value must be recoverable. The

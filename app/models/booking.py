@@ -93,6 +93,38 @@ class Booking(TimestampMixin, Base):
     The application pre-check and the 409 handling are Phase 4.
 
     ========================================================================
+    Deletion policy: a booking is NEVER hard-deleted. Rows are permanent.
+    ========================================================================
+
+    There is no supported code path that removes a booking row, and none
+    should be added. Every legitimate way a booking ends is already a
+    *state*: CANCELLED, EXPIRED, RESCHEDULED, NO_SHOW, COMPLETED. A row that
+    reached one of those still records that a real person asked for a real
+    time, and the payment, notification and intake rows hanging off it are
+    the audit trail of what was taken from them and what was sent to them.
+
+    Every foreign key into this table is `ON DELETE RESTRICT` — from
+    `payments`, `notification_log`, `intake_responses`, and this table's own
+    `rescheduled_from_id`. That uniformity is the point. An earlier version
+    had `intake_responses` on CASCADE, which meant a delete could
+    *half-succeed*: blocked for a booking with a payment, but silently
+    destroying the intake answers of an expired pending booking, which is
+    exactly the case where those answers are the only record left.
+
+    Note what RESTRICT does and does not give you. It makes deletion fail for
+    any booking that has acquired a child row, which in practice is all of
+    them within moments of creation. It does **not** forbid deleting a
+    booking that has none — a pending booking seconds old, before any payment
+    row exists. Closing that gap needs a BEFORE DELETE trigger or a revoked
+    DELETE grant, neither of which is worth adding until there is a reason to
+    believe someone would try. The rule is stated here so it is a rule, not
+    an inference from four separate column definitions.
+
+    If data ever has to be removed for a privacy request, that is a different
+    operation: redact the personal columns in place and keep the financial
+    record. A cascade could not express that distinction anyway.
+
+    ========================================================================
     Build bookings with `Booking.schedule()`. Never set `blocked_range`,
     or `ends_at_utc`, by hand.
     ========================================================================

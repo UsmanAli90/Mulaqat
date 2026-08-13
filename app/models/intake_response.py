@@ -28,9 +28,20 @@ class IntakeResponse(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     booking_id: Mapped[int] = mapped_column(
-        # CASCADE here, unlike bookings and payments: an answer has no meaning
-        # without its booking, and there is no financial record to preserve.
-        ForeignKey("bookings.id", ondelete="CASCADE"),
+        # RESTRICT, matching every other foreign key into `bookings`. This was
+        # CASCADE at first, on the reasoning that an answer has no meaning
+        # without its booking and there is no financial record to preserve.
+        # That was wrong, for a reason only visible once the other keys were
+        # RESTRICT: a booking with a payment, a notification or a reschedule
+        # link cannot be deleted at all, so the cascade could only ever fire
+        # for a booking with none of those — an expired pending one — where
+        # the intake answers are the *only* surviving record of what the
+        # person actually asked for.
+        #
+        # Mixed rules also let a delete half-succeed. Uniform RESTRICT makes
+        # it a single rule: nothing about a booking disappears quietly.
+        # See the deletion policy on the Booking model.
+        ForeignKey("bookings.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
