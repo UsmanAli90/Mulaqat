@@ -33,9 +33,9 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.session import SessionFactory, engine
+from app.db.session import create_engine
 from app.models import AvailabilityRule, Service, Settings
 from app.models.settings import SETTINGS_ID
 
@@ -203,15 +203,24 @@ async def seed(session: AsyncSession) -> SeedReport:
 
 
 async def _run() -> SeedReport:
-    # The shared engine echoes SQL when DEBUG=true locally, which is useful in
-    # a request log and useless here — it buries the report under sixty lines
-    # of INSERT. Quietened for this process only; the web app is unaffected.
-    engine.echo = False
+    """Build a private engine, seed, commit, dispose.
 
-    async with SessionFactory() as session:
-        report = await seed(session)
-        await session.commit()
-    await engine.dispose()
+    Deliberately does *not* use the shared `app.db.session.engine`. It echoes
+    SQL when DEBUG=true locally, which is useful in a request log and useless
+    here — it buries the report under sixty lines of INSERT. Silencing it by
+    assigning to the shared engine's `echo` would be a process-wide mutation
+    that is only safe while this module is exclusively a CLI entry point, and
+    that stops being true the first time something imports `seed()` from
+    inside the app. Owning an engine costs one line and removes the trap.
+    """
+    engine = create_engine(echo=False)
+    factory = async_sessionmaker(bind=engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            report = await seed(session)
+            await session.commit()
+    finally:
+        await engine.dispose()
     return report
 
 
