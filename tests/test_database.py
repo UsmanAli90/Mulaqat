@@ -6,6 +6,8 @@ silently broke, failures would show up as baffling cross-contamination in
 unrelated suites rather than here.
 """
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -15,11 +17,20 @@ PROBE_TABLE = "rollback_isolation_probe"
 
 
 async def test_migrations_have_been_applied(session: AsyncSession) -> None:
-    """The session-scoped fixture ran `alembic upgrade head` on a fresh DB."""
+    """The session-scoped fixture ran `alembic upgrade head` on a fresh DB.
+
+    Head is read from the migration scripts rather than hardcoded. A literal
+    revision ID would need editing in every phase that adds a migration, and
+    the day someone updated it carelessly the test would stop meaning
+    anything. This version also catches a second head appearing, which is the
+    failure mode the sequential-branch rule exists to prevent.
+    """
+    expected_head = ScriptDirectory.from_config(Config("alembic.ini")).get_current_head()
+
     result = await session.execute(text("SELECT version_num FROM alembic_version"))
     versions = result.scalars().all()
 
-    assert versions == ["15cc4a0cad0a"], "test database is not migrated to head"
+    assert versions == [expected_head], "test database is not migrated to head"
 
 
 async def test_rollback_isolation_erases_committed_writes(engine: AsyncEngine) -> None:

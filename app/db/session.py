@@ -12,12 +12,21 @@ from sqlalchemy.ext.asyncio import (
 from app.core.config import get_settings
 
 
-def create_engine() -> AsyncEngine:
-    """Build the async engine.
+def create_engine(*, echo: bool | None = None) -> AsyncEngine:
+    """Build an async engine.
 
-    The engine owns the connection pool and is created once per process. It is
-    the closest thing to ActiveRecord's connection pool, except it is an
-    explicit object you pass around rather than global state.
+    The engine owns the connection pool. It is the closest thing to
+    ActiveRecord's connection pool, except it is an explicit object you pass
+    around rather than global state.
+
+    Args:
+        echo: Override statement logging. Defaults to the environment-derived
+            behaviour below. A CLI that prints its own output passes False so
+            it can build a quiet engine of its own — which is why this is a
+            parameter rather than something a caller sets on the shared
+            `engine` afterwards. Mutating that shared object would be
+            process-wide, and "it's fine, we're a separate process" stops being
+            true the moment anything imports the caller from inside the app.
     """
     settings = get_settings()
     return create_async_engine(
@@ -25,7 +34,7 @@ def create_engine() -> AsyncEngine:
         # Log every statement in local development. Do not enable in
         # production: it prints bound parameters, which will include invitee
         # emails and payment references.
-        echo=settings.debug and settings.environment == "local",
+        echo=(settings.debug and settings.environment == "local") if echo is None else echo,
         # Verify a pooled connection is still alive before handing it out.
         # Without this, a connection killed by a Postgres restart or an
         # idle-timeout proxy surfaces as a confusing error on a random request.
